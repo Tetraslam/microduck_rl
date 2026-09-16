@@ -7389,3 +7389,522 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Skatepark: independent passive board, board-relative sensing, trick requests.
+# ---------------------------------------------------------------------------
+
+
+def _skate_yaw(quat):
+    w, x, y, z = quat.unbind(-1)
+    return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
+def _skate_relative(env):
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    robot, board = env.scene["robot"], env.scene["board"]
+    return quat_apply_inverse(
+        board.data.root_link_quat_w,
+        robot.data.root_link_pos_w - board.data.root_link_pos_w,
+    )
+
+
+def _skate_contacts(env, name):
+    return env.scene[name].data.found.reshape(env.num_envs, -1) > 0
+
+
+def skate_is_aboard(env):
+    relative = _skate_relative(env)
+    return (
+        (relative[:, 0].abs() < 0.17)
+        & (relative[:, 1].abs() < 0.11)
+        & (relative[:, 2] > 0.055)
+        & (relative[:, 2] < 0.30)
+    )
+
+
+def reset_skateboard(
+    env,
+    env_ids,
+    speed_range=(0.3, 0.65),
+    noise=0.003,
+    stationary_prob=0.1,
+    landing_start_prob=0.0,
+):
+    """Reset both roots and every passive hinge; no continuous assistance."""
+    from mjlab_microduck.robot.skateboard import (
+        DECK_Z,
+        DECK_TOP,
+        ROBOT_STAND_Z,
+        WHEEL_RADIUS,
+    )
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    origins = env.scene.env_origins[env_ids]
+    speed = torch.empty(n, device=env.device).uniform_(*speed_range)
+    # Include genuine stationary experience, not only a continuous distribution.
+    speed[torch.rand(n, device=env.device) < stationary_prob] = 0
+    stage = getattr(env, "_skate_progress", {}).get("stage", 0)
+    assisted = (torch.rand(n, device=env.device) < landing_start_prob) & (stage >= 2)
+    lift = assisted * torch.empty(n, device=env.device).uniform_(0.035, 0.05)
+    for name, height in (
+        ("robot", DECK_TOP + ROBOT_STAND_Z + 0.001),
+        ("board", DECK_Z),
+    ):
+        asset = env.scene[name]
+        state = asset.data.default_root_state[env_ids].clone()
+        state[:, :3] = origins
+        state[:, 2] += height + lift
+        state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
+        state[:, 7:] = 0
+        state[:, 7] = speed
+        state[:, 9] = -0.05 * assisted
+        q = asset.data.default_joint_pos[env_ids].clone()
+        dq = torch.zeros_like(q)
+        if name == "robot":
+            q += torch.randn_like(q) * noise
+        else:
+            wheels, _ = asset.find_joints(r"passive_.*_wheel")
+            dq[:, wheels] = speed[:, None] / WHEEL_RADIUS
+        asset.write_joint_state_to_sim(q, dq, env_ids=env_ids)
+        asset.write_root_state_to_sim(state, env_ids=env_ids)
+    if not hasattr(env, "_skate_start_pos"):
+        env._skate_start_pos = torch.zeros(env.num_envs, 3, device=env.device)
+        env._skate_start_speed = torch.zeros(env.num_envs, device=env.device)
+        env._skate_assisted_start = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+        env._skate_reset_step = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+    env._skate_start_pos[env_ids] = origins
+    env._skate_start_speed[env_ids] = speed
+    env._skate_assisted_start[env_ids] = assisted
+    env._skate_reset_step[env_ids] = env.common_step_counter
+
+
+def skate_board_observation(env):
+    """26D board/rider state; privileged in hardware, explicit in this sim task."""
+    from mjlab_microduck.robot.skateboard import WHEEL_RADIUS
+
+    board = env.scene["board"]
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    gravity = torch.zeros(env.num_envs, 3, device=env.device)
+    gravity[:, 2] = -1
+    delta_yaw = wrap_to_pi(
+        _skate_yaw(env.scene["robot"].data.root_link_quat_w)
+        - _skate_yaw(board.data.root_link_quat_w)
+    )
+    parts = [
+        _skate_relative(env),
+        board.data.root_link_lin_vel_b,
+        board.data.root_link_ang_vel_b,
+        quat_apply_inverse(board.data.root_link_quat_w, gravity),
+        board.data.joint_pos[:, board.find_joints(r"passive_.*_kingpin")[0]],
+        board.data.joint_vel[:, board.find_joints(r"passive_.*_wheel")[0]]
+        * WHEEL_RADIUS,
+        _skate_contacts(env, "feet_ground_contact").float(),
+        _skate_contacts(env, "board_ground_contact").float(),
+        torch.stack((torch.sin(delta_yaw), torch.cos(delta_yaw)), dim=-1),
+    ]
+    return torch.nan_to_num(torch.cat(parts, dim=-1)).clamp(-20, 20)
+
+
+def skate_terrain_observation(env):
+    return torch.nan_to_num(
+        env.scene["skate_scan"].data.heights.flatten(1),
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1, 1)
+
+
+def skate_fallen(env):
+    robot, board = env.scene["robot"], env.scene["board"]
+    relative = _skate_relative(env)
+    up = 1 - 2 * (robot.data.root_link_quat_w[:, 1:3] ** 2).sum(-1)
+    finite = (
+        torch.isfinite(board.data.root_link_pos_w).all(-1)
+        & torch.isfinite(board.data.root_link_quat_w).all(-1)
+        & torch.isfinite(board.data.root_link_lin_vel_w).all(-1)
+        & torch.isfinite(board.data.root_link_ang_vel_b).all(-1)
+        & torch.isfinite(board.data.joint_pos).all(-1)
+        & torch.isfinite(board.data.joint_vel).all(-1)
+    )
+    return (
+        (relative[:, 0].abs() > 0.30)
+        | (relative[:, 1].abs() > 0.22)
+        | (relative[:, 2] < 0.04)
+        | (up < 0.25)
+        | ~finite
+    )
+
+
+def skate_course_exit(env):
+    offset = env.scene["board"].data.root_link_pos_w - env.scene.env_origins
+    return (offset[:, 0] > 8.6) | (offset[:, 0] < -0.6) | (offset[:, 1].abs() > 1.8)
+
+
+def skate_riding_reward(env):
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    board = env.scene["board"]
+    command = env.command_manager.get_command("twist")
+    # Preserve forward-vx semantics; stationary-board dancing and travelling
+    # backwards must not satisfy a positive forward-speed command.
+    speed = quat_apply_inverse(
+        env.scene["robot"].data.root_link_quat_w, board.data.root_link_lin_vel_w
+    )[:, 0]
+    tracking = torch.exp(-(((speed - command[:, 0]) / 0.25) ** 2))
+    turn = torch.exp(
+        -(((board.data.root_link_ang_vel_b[:, 2] - command[:, 2]) / 0.12) ** 2)
+    )
+    upright = (
+        1 - 2 * (env.scene["robot"].data.root_link_quat_w[:, 1:3] ** 2).sum(-1)
+    ).clamp(0, 1)
+    supported = _skate_contacts(env, "feet_ground_contact").any(-1).float()
+    trick = env.command_manager.get_term("skate_trick")
+    turn = torch.where(
+        (trick.mode == 2) & ~trick.completed, torch.ones_like(turn), turn
+    )
+    return tracking * turn * upright.pow(2) * supported * skate_is_aboard(env)
+
+
+def skate_stance_reward(env):
+    from mjlab_microduck.robot.skateboard import ROBOT_STAND_Z, DECK_TOP, DECK_Z
+
+    relative = _skate_relative(env)
+    body = env.command_manager.get_command("body_pose")
+    # Broad enough for compression/pop; no fixed joint trajectory.
+    error = (relative[:, 2] - (ROBOT_STAND_Z + DECK_TOP - DECK_Z + body[:, 2])) / 0.06
+    centered = torch.exp(-((relative[:, :2] / 0.10) ** 2).sum(-1))
+    up = (
+        1 - 2 * (env.scene["robot"].data.root_link_quat_w[:, 1:3] ** 2).sum(-1)
+    ).clamp(0, 1)
+    # Pose shaping cannot dominate the task by paying for parking before ramps.
+    # Exact-zero commands still reward a quiet, stationary stance.
+    task_gate = 0.05 + 0.95 * skate_riding_reward(env)
+    return (
+        centered
+        * torch.exp(-error.square())
+        * up.square()
+        * skate_is_aboard(env)
+        * task_gate
+    )
+
+
+def skate_slip_cost(env):
+    """Charge sideways sliding and wheel/ground speed mismatch, not forward roll."""
+    from mjlab_microduck.robot.skateboard import WHEEL_RADIUS
+
+    board = env.scene["board"]
+    wheel_ids, _ = board.find_joints(r"passive_.*_wheel")
+    rolling = board.data.joint_vel[:, wheel_ids].mean(-1) * WHEEL_RADIUS
+    velocity = board.data.root_link_lin_vel_b
+    grounded = _skate_contacts(env, "board_ground_contact").any(-1)
+    return (velocity[:, 1].square() + (velocity[:, 0] - rolling).square()) * grounded
+
+
+def skate_landing_valid(
+    air_time,
+    grounded,
+    feet_supported,
+    aboard,
+    robot_up,
+    board_up,
+    speed,
+    yaw_error,
+    mode,
+    air_rotation,
+):
+    """Pure success gate, shared by the live task and adversarial tests."""
+    return (
+        (air_time >= 0.06)
+        & grounded
+        & feet_supported
+        & aboard
+        & (robot_up > 0.70)
+        & (board_up > 0.85)
+        & (speed > 0.12)
+        & (yaw_error.abs() < 0.35)
+        & ((mode != 2) | (air_rotation.abs() > 2.4))
+    )
+
+
+@_dataclass(kw_only=True)
+class SkateTrickCommandCfg(CommandTermCfg):
+    play_stage: int | None = None
+    play_mode: str = "auto"
+
+    def build(self, env):
+        return SkateTrickCommand(self, env)
+
+
+class SkateTrickCommand(CommandTerm):
+    """Continuing, command-conditioned ride/ollie/180 windows; no pose waypoints."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        for name in (
+            "target_yaw",
+            "previous_yaw",
+            "air_time",
+            "air_rotation",
+            "peak",
+            "settled",
+            "progress",
+            "completion",
+            "attempts",
+            "successes",
+        ):
+            setattr(self, name, torch.zeros(self.num_envs, device=self.device))
+        self.completed = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.assisted = self.completed.clone()
+        self.assisted_successes = torch.zeros(self.num_envs, device=self.device)
+        self._cache_step = -1
+        self.metrics["completed_per_episode"] = self.successes
+        self.metrics["requested_per_episode"] = self.attempts
+        self.metrics["assisted_landings"] = self.assisted_successes
+
+    @property
+    def command(self):
+        yaw = _skate_yaw(self._env.scene["board"].data.root_link_quat_w)
+        error = wrap_to_pi(self.target_yaw - yaw)
+        # After landing, explicitly ask for ride-away until the next request.
+        # This also makes consecutive identical tricks observable as new goals.
+        visible_mode = torch.where(
+            self.completed, torch.zeros_like(self.mode), self.mode
+        )
+        return torch.cat(
+            (
+                torch.nn.functional.one_hot(visible_mode, 3).float(),
+                torch.sin(error)[:, None],
+                torch.cos(error)[:, None],
+            ),
+            dim=-1,
+        )
+
+    def _resample_command(self, env_ids):
+        stage = self.cfg.play_stage
+        if stage is None:
+            stage = getattr(self._env, "_skate_progress", {}).get("stage", 0)
+        sample = torch.rand(len(env_ids), device=self.device)
+        mode = torch.zeros_like(sample, dtype=torch.long)
+        if stage >= 2:
+            mode[sample < 0.50] = 1
+        if stage >= 3:
+            mode[sample < 0.20] = 2
+        if self.cfg.play_mode in ("ride", "ollie", "180"):
+            mode[:] = {"ride": 0, "ollie": 1, "180": 2}[self.cfg.play_mode]
+        elif self.cfg.play_mode == "chain":
+            mode[:] = 1 + self.command_counter[env_ids] % 2
+        starts = getattr(
+            self._env, "_skate_assisted_start", torch.zeros_like(self.assisted)
+        )
+        self.assisted[env_ids] = starts[env_ids] & (self.command_counter[env_ids] == 0)
+        mode[self.assisted[env_ids]] = 1
+        self.mode[env_ids] = mode
+        yaw = _skate_yaw(self._env.scene["board"].data.root_link_quat_w)[env_ids]
+        # Command reset runs before sim.forward. The reset event writes identity
+        # root quaternions, but xquat still describes the previous episode here.
+        yaw = torch.where(
+            self.command_counter[env_ids] == 0, torch.zeros_like(yaw), yaw
+        )
+        self.target_yaw[env_ids] = wrap_to_pi(yaw + (mode == 2) * math.pi)
+        self.previous_yaw[env_ids] = yaw
+        for name in (
+            "air_time",
+            "air_rotation",
+            "peak",
+            "settled",
+            "progress",
+            "completion",
+        ):
+            getattr(self, name)[env_ids] = 0
+        self.completed[env_ids] = False
+        self.attempts[env_ids] += (mode > 0) & ~self.assisted[env_ids]
+
+    def _update_metrics(self):
+        pass  # Counters are accumulated at the reward boundary, before resets.
+
+    def _update_command(self):
+        pass
+
+    def create_gui(
+        self, name, server, get_env_idx, on_change=None, request_action=None
+    ):
+        control = server.gui.add_dropdown(
+            "Next skateboard request",
+            options=("auto", "ride", "ollie", "180", "chain"),
+            initial_value=self.cfg.play_mode,
+        )
+
+        @control.on_update
+        def update(_event):
+            # Only edit a Python config value from the UI thread. The simulation
+            # samples it at the next request boundary; no GPU state is mutated.
+            self.cfg.play_mode = control.value
+
+    def update_state(self):
+        from mjlab_microduck.robot.skateboard import DECK_Z
+
+        env = self._env
+        if self._cache_step == env.common_step_counter:
+            return
+        self._cache_step = env.common_step_counter
+        board, robot = env.scene["board"], env.scene["robot"]
+        wheels = _skate_contacts(env, "board_ground_contact")
+        yaw = _skate_yaw(board.data.root_link_quat_w)
+        clearance = env.scene["board_clearance"].data.heights[:, 0] - DECK_Z
+        airborne = (
+            ~_skate_contacts(env, "board_support_contact").any(-1)
+            & (clearance > 0.012)
+            & skate_is_aboard(env)
+        )
+        self.air_time += airborne * env.step_dt
+        self.air_rotation += wrap_to_pi(yaw - self.previous_yaw) * airborne
+        self.previous_yaw.copy_(yaw)
+        active = (self.mode > 0) & ~self.completed
+        potential = (clearance.clamp(0, 0.035) / 0.035) * airborne
+        potential += (
+            (self.mode == 2)
+            * (self.air_rotation.abs() / math.pi).clamp(0, 1)
+            * airborne
+        )
+        frontier = torch.maximum(self.peak, potential)
+        self.progress.copy_((frontier - self.peak) * active / env.step_dt)
+        self.peak.copy_(frontier)
+        r_up = 1 - 2 * (robot.data.root_link_quat_w[:, 1:3] ** 2).sum(-1)
+        b_up = 1 - 2 * (board.data.root_link_quat_w[:, 1:3] ** 2).sum(-1)
+        valid = skate_landing_valid(
+            self.air_time,
+            wheels.sum(-1) >= 3,
+            _skate_contacts(env, "feet_ground_contact").all(-1),
+            skate_is_aboard(env),
+            r_up,
+            b_up,
+            board.data.root_link_lin_vel_w[:, :2].norm(dim=-1),
+            wrap_to_pi(self.target_yaw - yaw),
+            self.mode,
+            self.air_rotation,
+        )
+        self.settled.copy_(
+            torch.where(
+                valid, self.settled + env.step_dt, torch.zeros_like(self.settled)
+            )
+        )
+        success = active & (self.settled >= 0.12)
+        self.completion.copy_(success.float() / env.step_dt)
+        self.completed |= success
+        self.successes += success & ~self.assisted
+        self.assisted_successes += success & self.assisted
+
+
+def skate_trick_reward(env, kind="completion"):
+    term = env.command_manager.get_term("skate_trick")
+    term.update_state()
+    return getattr(term, kind)
+
+
+def skate_episode_success(seconds, distance, initial_speed, aboard, terminated):
+    travelled = (distance > initial_speed * 2) | (initial_speed == 0)
+    return (seconds > 7.0) & travelled & aboard & ~terminated
+
+
+def skate_curriculum(env, env_ids):
+    """Competence-gated promotion; adaptive state is persisted by SkateOnPolicyRunner."""
+    if not hasattr(env, "_skate_progress"):
+        env._skate_progress = dict(
+            stage=0, ride_ema=0.0, trick_ema=0.0, episodes=0, landed=0.0
+        )
+    p = env._skate_progress
+    if not hasattr(env, "reset_terminated"):
+        return float(p["stage"])
+    if env_ids is None or len(env_ids) == 0 or not hasattr(env, "_skate_start_pos"):
+        return float(p["stage"])
+    actual_seconds = (
+        env.common_step_counter - env._skate_reset_step[env_ids]
+    ) * env.step_dt
+    # PPO randomizes its initial episode-length buffer. Ignore short startup
+    # timeouts rather than counting artificial age as riding competence.
+    valid = (actual_seconds > 0) & (
+        (actual_seconds >= 7.0) | env.reset_terminated[env_ids]
+    )
+    ids = env_ids[valid]
+    if len(ids) == 0:
+        return float(p["stage"])
+    board = env.scene["board"]
+    distance = (
+        board.data.root_link_pos_w[ids, :2] - env._skate_start_pos[ids, :2]
+    ).norm(dim=-1)
+    survived = skate_episode_success(
+        (env.common_step_counter - env._skate_reset_step[ids]) * env.step_dt,
+        distance,
+        env._skate_start_speed[ids],
+        skate_is_aboard(env)[ids],
+        env.reset_terminated[ids],
+    )
+    alpha = 1 - math.exp(-len(ids) / 1024)
+    p["ride_ema"] += alpha * (survived.float().mean().item() - p["ride_ema"])
+    p["episodes"] += len(ids)
+    term = env.command_manager.get_term("skate_trick")
+    attempted = term.attempts[ids].sum().item()
+    landed = term.successes[ids].sum().item()
+    if attempted > 0:
+        rate = landed / attempted
+        p["trick_ema"] += (1 - math.exp(-attempted / 256)) * (rate - p["trick_ema"])
+        p["landed"] += landed
+    step = env.common_step_counter
+    if p["stage"] == 0 and step >= 500 * 24 and p["ride_ema"] > 0.7:
+        p["stage"] = 1
+    if p["stage"] == 1 and step >= 1200 * 24 and p["ride_ema"] > 0.7:
+        p["stage"] = 2
+    if (
+        p["stage"] == 2
+        and step >= 2000 * 24
+        and p["trick_ema"] > 0.5
+        and p["landed"] >= 100
+    ):
+        p["stage"] = 3
+    terrain = env.scene.terrain
+    if (
+        p["stage"] >= 1
+        and terrain is not None
+        and terrain.cfg.terrain_type == "generator"
+    ):
+        # Standing still can be a valid idle trial, but cannot prove terrain skill.
+        terrain.update_env_origins(ids, survived & (distance > 2.5), ~survived)
+    return float(p["stage"])
+
+
+def skate_metric(env, field):
+    if field == "aboard":
+        return skate_is_aboard(env).float()
+    if field == "speed":
+        return env.scene["board"].data.root_link_lin_vel_w[:, :2].norm(dim=-1)
+    if field == "chain":
+        return (env.command_manager.get_term("skate_trick").successes >= 2).float()
+    if field == "terrain_level":
+        return env.scene.terrain.terrain_levels.float()
+    return torch.full(
+        (env.num_envs,),
+        getattr(env, "_skate_progress", {}).get(field, 0.0),
+        device=env.device,
+    )
+
+
+def skate_quality_cost(env, kind="impact"):
+    """Positive cost, ramped only after unassisted tricks start succeeding."""
+    competence = getattr(env, "_skate_progress", {}).get("trick_ema", 0.0)
+    strength = min(1.0, max(0.0, (competence - 0.3) / 0.4))
+    if kind == "impact":
+        return -trunk_vertical_accel_penalty(env) * strength
+    return joint_torque_rate_l2(env) * strength

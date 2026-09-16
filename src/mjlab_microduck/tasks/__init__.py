@@ -76,6 +76,80 @@ from .microduck_roulade_env_cfg import (
     MicroduckRouladeRlCfg,
 )
 from .backlash import make_backlash_variant
+from .microduck_skatepark_env_cfg import (
+    make_microduck_skatepark_env_cfg,
+    MicroduckSkateparkRlCfg,
+)
+
+
+class SkateOnPolicyRunner(MicroduckOnPolicyRunner):
+    """Preserve competence-gated curriculum across same-task checkpoint resumes."""
+
+    def export_policy_to_onnx(self, path, filename="policy.onnx", verbose=False):
+        from pathlib import Path
+        from mjlab.rl.exporter_utils import attach_metadata_to_onnx
+
+        super().export_policy_to_onnx(path, filename, verbose)
+        action = self.env.unwrapped.action_manager.get_term("joint_pos")
+        attach_metadata_to_onnx(
+            str(Path(path) / filename),
+            {
+                "skate_observation_contract": "skatepark-v1:actor61+board26+terrain15+goal5",
+                "skate_action_offset": action.offset[0].cpu().tolist(),
+            },
+        )
+
+    def save(self, path, infos=None):
+        state = dict(getattr(self.env.unwrapped, "_skate_progress", {}))
+        extra = {**(infos or {}), "skate_curriculum": state}
+        terrain = self.env.unwrapped.scene.terrain
+        if terrain is not None and terrain.cfg.terrain_type == "generator":
+            extra["skate_terrain_levels"] = terrain.terrain_levels.cpu().tolist()
+        super().save(path, extra)
+
+    def load(self, path, load_cfg=None, strict=True, map_location=None):
+        infos = super().load(
+            path, load_cfg=load_cfg, strict=strict, map_location=map_location
+        )
+        # Native load restores the global clock, not simulator state. Rebase
+        # ages before any reset/curriculum callback can observe the new clock.
+        env = self.env.unwrapped
+        if hasattr(env, "_skate_reset_step"):
+            env._skate_reset_step.fill_(env.common_step_counter)
+        if infos and "skate_curriculum" in infos:
+            self.env.unwrapped._skate_progress = dict(infos["skate_curriculum"])
+        # Full training resumes keep the terrain distribution. Actor-only loads
+        # (play/export) respect the caller's selected course and difficulty.
+        if load_cfg is None and infos and "skate_terrain_levels" in infos:
+            import torch
+
+            env = self.env.unwrapped
+            terrain = env.scene.terrain
+            if terrain is not None and terrain.cfg.terrain_type == "generator":
+                levels = torch.tensor(
+                    infos["skate_terrain_levels"], device=env.device, dtype=torch.long
+                )
+                if len(levels) != env.num_envs:
+                    levels = levels[
+                        torch.randint(len(levels), (env.num_envs,), device=env.device)
+                    ]
+                terrain.terrain_levels.copy_(
+                    levels.clamp(0, terrain.max_terrain_level - 1)
+                )
+                ids = torch.arange(env.num_envs, device=env.device)
+                zeros = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+                terrain.update_env_origins(ids, zeros, zeros)
+                env.reset()
+        return infos
+
+
+register_mjlab_task(
+    task_id="Mjlab-Skatepark-MicroDuck",
+    env_cfg=make_microduck_skatepark_env_cfg(),
+    play_env_cfg=make_microduck_skatepark_env_cfg(play=True),
+    rl_cfg=MicroduckSkateparkRlCfg,
+    runner_cls=SkateOnPolicyRunner,
+)
 
 # Standard velocity task
 register_mjlab_task(

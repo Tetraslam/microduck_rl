@@ -39,6 +39,19 @@ Volume commit. Local CLI exit must not cancel training: use `.spawn()`, not a
 synchronous `.remote()` call. B300 requires a separate CUDA 13.1+ validation;
 the tested lockfile supports B200/H100/A100/L40S.
 
+### Skatepark simulation
+
+`Mjlab-Skatepark-MicroDuck` is an experimental, simulation-only policy family.
+See `docs/skatepark.md`. It preserves the canonical 61D observation group and
+adds a separate 46D `skate` group; its actor/ONNX is 107D and must not be published
+as a hardware-hot-swappable 61D policy. Only the robot's 14 BAM joints are
+actuated; the board is a separate passive entity with no foot attachments.
+`scripts/play_skatepark.py` provides preview, playback, recording and headless
+evaluation. `--preview` is fixed-target physics, not a learned policy.
+Adaptive curriculum state and terrain levels are saved by `SkateOnPolicyRunner`.
+Assisted landing spawns are training-only and excluded from unassisted trick
+success/chain metrics. Keep that distinction when reporting results.
+
 ## Repo map
 
 - `src/mjlab_microduck/tasks/mdp.py` — ALL custom MDP functions (rewards, events,
