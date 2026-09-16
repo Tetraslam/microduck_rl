@@ -40,6 +40,7 @@ from mjlab_microduck.tasks.skatepark_terrain import (
 ENABLE_TRICKS = True
 PARK_SIZE = (10.0, 4.0)
 PARK_SEED = 42
+CONTROL_RAMP_ITERATIONS = 200
 
 
 def make_microduck_skatepark_env_cfg(play=False, flat=False):
@@ -162,12 +163,12 @@ def make_microduck_skatepark_env_cfg(play=False, flat=False):
         "reset_skateboard": EventTermCfg(
             func=mdp.reset_skateboard,
             mode="reset",
-            params={"landing_start_prob": 0.0 if play else 0.2},
+            params={"landing_start_prob": 0.0 if play else 0.2, "sideways_prob": 0.0},
         ),
         **cfg.events,
     }
     cfg.curriculum = {"skate_stage": CurriculumTermCfg(func=mdp.skate_curriculum)}
-    for field in ("aboard", "speed", "ride_ema", "trick_ema", "chain"):
+    for field in ("aboard", "speed", "raw_speed", "ride_ema", "trick_ema", "chain"):
         cfg.metrics[f"skate_{field}"] = MetricsTermCfg(
             func=mdp.skate_metric,
             params={"field": field},
@@ -229,6 +230,24 @@ def make_microduck_skatepark_env_cfg(play=False, flat=False):
             "skate_torque_rate": RewardTermCfg(
                 func=mdp.skate_quality_cost, weight=-0.0002, params={"kind": "torque"}
             ),
+            "control_action_rate": RewardTermCfg(
+                func=mdp.skate_control_cost,
+                weight=-0.07,
+                params={"kind": "action", "ramp_iterations": CONTROL_RAMP_ITERATIONS},
+            ),
+            "control_neck_rate": RewardTermCfg(
+                func=mdp.skate_control_cost,
+                weight=-0.10,
+                params={"kind": "neck", "ramp_iterations": CONTROL_RAMP_ITERATIONS},
+            ),
+            "control_torque_rate": RewardTermCfg(
+                func=mdp.skate_control_cost,
+                weight=-0.02,
+                params={"kind": "torque", "ramp_iterations": CONTROL_RAMP_ITERATIONS},
+            ),
+            "foreaft_stance": RewardTermCfg(
+                func=mdp.skate_foreaft_stance_reward, weight=0.0
+            ),
         }
     )
     cfg.terminations.pop("fell_over", None)
@@ -255,5 +274,6 @@ MicroduckSkateparkRlCfg.obs_groups = {
 }
 MicroduckSkateparkRlCfg.actor.distribution_cfg["init_std"] = 0.3
 MicroduckSkateparkRlCfg.algorithm.symmetry_cfg = None
+MicroduckSkateparkRlCfg.algorithm.entropy_coef = 0.002
 MicroduckSkateparkRlCfg.max_iterations = 10000
 MicroduckSkateparkRlCfg.save_interval = 50

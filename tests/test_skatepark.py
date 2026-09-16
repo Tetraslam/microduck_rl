@@ -158,11 +158,13 @@ def fake_trick():
             root_link_pos_w=tensor([0, 0, 0.166]), root_link_quat_w=tensor([1, 0, 0, 0])
         )
     )
+    board.data.root_link_lin_vel_b = board.data.root_link_lin_vel_w
     env = SimpleNamespace(
         num_envs=1,
         device="cpu",
         step_dt=0.02,
         common_step_counter=0,
+        _skate_reset_step=torch.zeros(1, dtype=torch.long),
         scene={
             "robot": robot,
             "board": board,
@@ -307,7 +309,7 @@ def test_new_episode_goal_does_not_read_stale_previous_heading():
     assert term.previous_yaw.item() == 0
 
 
-def test_forward_command_requires_forward_board_motion():
+def test_rolling_command_allows_sideways_rider_and_fakie_but_not_sliding():
     env, term = fake_trick()
     env.scene["board"].data.root_link_ang_vel_b = torch.zeros(1, 3)
     env.command_manager = SimpleNamespace(
@@ -316,9 +318,103 @@ def test_forward_command_requires_forward_board_motion():
     )
     assert mdp.skate_riding_reward(env).item() == pytest.approx(1.0)
     env.scene["board"].data.root_link_lin_vel_w[:, 0] = -0.5
-    assert mdp.skate_riding_reward(env).item() < 0.001
+    env.common_step_counter += 2
+    env._skate_reset_step[:] = env.common_step_counter
+    assert mdp.skate_riding_reward(env).item() == pytest.approx(1.0)
+    env.scene["robot"].data.root_link_quat_w[:] = torch.tensor(
+        [[2**-0.5, 0, 0, 2**-0.5]]
+    )
+    assert mdp.skate_riding_reward(env).item() == pytest.approx(1.0)
     env.scene["board"].data.root_link_lin_vel_w[:] = 0
+    env.scene["board"].data.root_link_lin_vel_w[:, 1] = 0.5
+    env.common_step_counter += 2
+    env._skate_reset_step[:] = env.common_step_counter
     assert mdp.skate_riding_reward(env).item() < 0.1
+
+
+def test_control_ramp_is_gradual_persistent_and_cannot_be_escaped():
+    env = SimpleNamespace(common_step_counter=7000, _skate_progress={"ride_ema": 0.2})
+    assert mdp.skate_control_strength(env) == 0
+    assert "control_start_step" not in env._skate_progress
+    env._skate_progress["ride_ema"] = 0.8
+    assert mdp.skate_control_strength(env) == 0
+    env.common_step_counter += 100 * 24
+    assert mdp.skate_control_strength(env) == 0.5
+    restored = SimpleNamespace(
+        common_step_counter=env.common_step_counter,
+        _skate_progress=dict(env._skate_progress),
+    )
+    restored._skate_progress["ride_ema"] = 0
+    assert mdp.skate_control_strength(restored) == 0.5
+    restored.common_step_counter += 100 * 24
+    assert mdp.skate_control_strength(restored) == 1
+
+
+def test_control_costs_are_name_resolved_reset_safe_and_leave_trick_freedom():
+    goal = SimpleNamespace(mode=torch.tensor([0]), completed=torch.tensor([False]))
+    torque = torch.zeros(1, 4)
+    env = SimpleNamespace(
+        common_step_counter=6000,
+        _skate_reset_step=torch.tensor([0]),
+        _skate_progress={"ride_ema": 0.8, "control_start_step": 1200},
+        scene={"robot": SimpleNamespace(data=SimpleNamespace(actuator_force=torque))},
+        action_manager=SimpleNamespace(
+            action=torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            prev_action=torch.zeros(1, 4),
+            get_term=lambda name: SimpleNamespace(
+                target_names=["hip", "head_yaw", "knee", "neck_pitch"]
+            ),
+        ),
+        command_manager=SimpleNamespace(get_term=lambda name: goal),
+    )
+    assert mdp.skate_control_cost(env).item() == 30
+    assert mdp.skate_control_cost(env, "neck").item() == 20
+    goal.mode[:] = 1
+    assert mdp.skate_control_cost(env).item() == pytest.approx(23.5)
+    assert mdp.skate_control_cost(env, "neck").item() == 20
+    env.common_step_counter += 1
+    torque[:] = 1
+    assert mdp.skate_control_terms(env)["torque"].item() == 4
+    assert mdp.skate_control_terms(env)["torque"].item() == 4
+    env.common_step_counter += 1
+    env._skate_reset_step[:] = env.common_step_counter - 1
+    torque[:] = 2
+    assert mdp.skate_control_cost(env).item() == 0
+    assert mdp.skate_control_cost(env, "torque").item() == 0
+    env.common_step_counter += 1
+    assert mdp.skate_control_terms(env)["torque"].item() == 0
+
+
+def test_small_real_hops_get_shaping_without_being_credited_as_tricks():
+    env, term = fake_trick()
+    env.scene["board_support_contact"].data.found[:] = 0
+    env.scene["board_clearance"].data.heights[:] = 0.048
+    env.common_step_counter += 1
+    term.update_state()
+    assert term.progress.item() > 0
+    assert term.air_time.item() == 0
+    assert term.successes.item() == 0
+    env.common_step_counter += 1
+    term.update_state()
+    assert term.progress.item() == 0  # Holding a small airborne gap is not an annuity.
+
+
+def test_foreaft_stance_requires_supported_feet_and_saturates():
+    env, term = fake_trick()
+    robot = env.scene["robot"]
+    robot.find_sites = lambda names: ([0, 1], list(names))
+    robot.data.site_pos_w = torch.tensor([[[0.042, 0.0, 0.05], [-0.042, 0.0, 0.05]]])
+    env.scene["board"].data.root_link_ang_vel_b = torch.zeros(1, 3)
+    env.command_manager = SimpleNamespace(
+        get_command=lambda name: torch.tensor([[0.5, 0.0, 0.0]]),
+        get_term=lambda name: term,
+    )
+    assert mdp.skate_foreaft_stance_reward(env).item() == pytest.approx(1.0)
+    env.scene["feet_ground_contact"].data.found[:, 1] = 0
+    assert mdp.skate_foreaft_stance_reward(env).item() == 0
+    env.scene["feet_ground_contact"].data.found[:] = 1
+    robot.data.site_pos_w[:] = torch.tensor([[[0.0, 0.042, 0.05], [0.0, -0.042, 0.05]]])
+    assert mdp.skate_foreaft_stance_reward(env).item() == 0
 
 
 def test_ppo_random_episode_age_cannot_fake_curriculum_success():
@@ -351,6 +447,43 @@ def test_pose_reward_cannot_be_farmed_by_parking_under_forward_command():
     )
     moving = mdp.skate_stance_reward(env).item()
     env.scene["board"].data.root_link_lin_vel_w[:] = 0
+    env.common_step_counter += 2
+    env._skate_reset_step[:] = env.common_step_counter
     assert mdp.skate_stance_reward(env).item() < moving * 0.1
     target[:] = 0
     assert mdp.skate_stance_reward(env).item() == pytest.approx(moving)
+
+
+def test_sustained_speed_rejects_reversal_dither_and_resets_cleanly():
+    env, _ = fake_trick()
+    env._skate_reset_step[:] = -10
+    late = []
+    for step in range(120):
+        env.common_step_counter += 1
+        env.scene["board"].data.root_link_lin_vel_w[:, 0] = 0.5 if step % 2 else -0.5
+        speed = mdp.skate_sustained_speed(env).item()
+        assert mdp.skate_sustained_speed(env).item() == speed
+        if step > 100:
+            late.append(speed)
+    assert max(late) < 0.03
+    env._skate_reset_step[:] = env.common_step_counter
+    env.common_step_counter += 1
+    env.scene["board"].data.root_link_lin_vel_w[:, 0] = 0.4
+    assert mdp.skate_sustained_speed(env).item() == pytest.approx(0.4)
+    # Board turns 180 but continues travelling in the same world direction.
+    env.scene["board"].data.root_link_quat_w[:] = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
+    assert mdp.skate_sustained_speed(env).item() == pytest.approx(0.4)
+
+
+def test_pop_setup_shapes_progress_but_cannot_farm_or_count_as_flight():
+    env, term = fake_trick()
+    env.scene["board"].data.root_link_quat_w[:] = torch.tensor(
+        [[np.cos(0.1), 0.0, -np.sin(0.1), 0.0]]
+    )
+    env.common_step_counter += 1
+    term.update_state()
+    assert 0 < term.progress.item() * env.step_dt <= 0.15
+    assert term.air_time.item() == 0 and term.successes.item() == 0
+    env.common_step_counter += 1
+    term.update_state()
+    assert term.progress.item() == 0

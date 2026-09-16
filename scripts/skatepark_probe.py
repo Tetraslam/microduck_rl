@@ -5,6 +5,7 @@ Reports tilt as well as height; disabled terminations prevent resets hiding fall
 """
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ from mjlab_microduck.tasks.microduck_skatepark_env_cfg import (
 from mjlab_microduck.tasks import mdp
 
 
-def probe(speed, landing=False):
+def probe(speed, landing=False, rider_yaw=0.0):
     cfg = make_microduck_skatepark_env_cfg(flat=True)
     cfg.scene.num_envs = 16
     cfg.seed = 42
@@ -35,6 +36,7 @@ def probe(speed, landing=False):
         speed_range=(speed, speed),
         stationary_prob=0.0,
         landing_start_prob=1.0 if landing else 0.0,
+        rider_yaw=rider_yaw,
     )
     env = ManagerBasedRlEnv(cfg, device="cuda:0")
     if landing:
@@ -54,6 +56,7 @@ def probe(speed, landing=False):
     )
     result = {
         "speed": speed,
+        "rider_yaw_deg": math.degrees(rider_yaw),
         "assisted_landing_start": landing,
         "tilt_degrees_median": tilt.median().item(),
         "tilt_degrees_max": tilt.max().item(),
@@ -86,6 +89,7 @@ def probe(speed, landing=False):
         speed_range=(speed, speed),
         noise=0.0,
         stationary_prob=0.0,
+        rider_yaw=rider_yaw,
     )
     mask = torch.ones(16, dtype=torch.bool, device=env.device)
     mask[[0, 3]] = False
@@ -97,6 +101,7 @@ def probe(speed, landing=False):
         speed_range=(speed, speed),
         noise=0.0,
         stationary_prob=0.0,
+        rider_yaw=rider_yaw,
     )
     result["reset_non_accumulating"] = bool(torch.equal(once, env.sim.data.qpos))
     env.close()
@@ -104,7 +109,13 @@ def probe(speed, landing=False):
 
 
 if __name__ == "__main__":
-    results = [probe(0.0), probe(0.5), probe(0.5, landing=True)]
+    results = [
+        probe(0.0),
+        probe(0.5),
+        probe(0.5, landing=True),
+        probe(0.5, rider_yaw=math.pi / 2),
+        probe(0.5, rider_yaw=-math.pi / 2),
+    ]
     path = Path("logs/skatepark-physics.json")
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(results, indent=2) + "\n")

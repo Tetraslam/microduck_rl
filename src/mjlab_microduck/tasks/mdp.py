@@ -7432,6 +7432,8 @@ def reset_skateboard(
     noise=0.003,
     stationary_prob=0.1,
     landing_start_prob=0.0,
+    sideways_prob=0.0,
+    rider_yaw=0.0,
 ):
     """Reset both roots and every passive hinge; no continuous assistance."""
     from mjlab_microduck.robot.skateboard import (
@@ -7451,6 +7453,11 @@ def reset_skateboard(
     stage = getattr(env, "_skate_progress", {}).get("stage", 0)
     assisted = (torch.rand(n, device=env.device) < landing_start_prob) & (stage >= 2)
     lift = assisted * torch.empty(n, device=env.device).uniform_(0.035, 0.05)
+    rider_angles = torch.full((n,), rider_yaw, device=env.device)
+    if sideways_prob > 0:
+        side = torch.rand(n, device=env.device) < sideways_prob
+        sign = torch.where(torch.rand(n, device=env.device) < 0.5, -1.0, 1.0)
+        rider_angles = torch.where(side, sign * math.pi / 2, rider_angles)
     for name, height in (
         ("robot", DECK_TOP + ROBOT_STAND_Z + 0.001),
         ("board", DECK_Z),
@@ -7466,6 +7473,8 @@ def reset_skateboard(
         q = asset.data.default_joint_pos[env_ids].clone()
         dq = torch.zeros_like(q)
         if name == "robot":
+            state[:, 3] = torch.cos(rider_angles / 2)
+            state[:, 6] = torch.sin(rider_angles / 2)
             q += torch.randn_like(q) * noise
         else:
             wheels, _ = asset.find_joints(r"passive_.*_wheel")
@@ -7551,15 +7560,12 @@ def skate_course_exit(env):
 
 
 def skate_riding_reward(env):
-    from mjlab.utils.lab_api.math import quat_apply_inverse
-
     board = env.scene["board"]
     command = env.command_manager.get_command("twist")
-    # Preserve forward-vx semantics; stationary-board dancing and travelling
-    # backwards must not satisfy a positive forward-speed command.
-    speed = quat_apply_inverse(
-        env.scene["robot"].data.root_link_quat_w, board.data.root_link_lin_vel_w
-    )[:, 0]
+    # A skater can face sideways and land fakie. Speed is longitudinal board
+    # travel, independent of the rider's facing direction; lateral sliding and
+    # dancing on a stationary deck do not satisfy it. Commands are nonnegative.
+    speed = skate_sustained_speed(env)
     tracking = torch.exp(-(((speed - command[:, 0]) / 0.25) ** 2))
     turn = torch.exp(
         -(((board.data.root_link_ang_vel_b[:, 2] - command[:, 2]) / 0.12) ** 2)
@@ -7573,6 +7579,34 @@ def skate_riding_reward(env):
         (trick.mode == 2) & ~trick.completed, torch.ones_like(turn), turn
     )
     return tracking * turn * upright.pow(2) * supported * skate_is_aboard(env)
+
+
+def skate_sustained_speed(env, tau_s=0.3):
+    """Average signed world velocity before taking speed in the board frame.
+
+    Magnitude-before-average pays for rattling in place. World-frame averaging
+    also avoids a fictitious stop when an airborne 180 reverses the board frame.
+    This filters a reward measurement, never policy actions or observations.
+    """
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    if tau_s <= 0:
+        raise ValueError("tau_s must be positive")
+    board = env.scene["board"]
+    if getattr(env, "_skate_motion_step", -1) != env.common_step_counter:
+        current = torch.nan_to_num(board.data.root_link_lin_vel_w)
+        previous = getattr(env, "_skate_velocity_ema", current)
+        filtered = previous + (1 - math.exp(-env.step_dt / tau_s)) * (
+            current - previous
+        )
+        fresh = env.common_step_counter - env._skate_reset_step <= 1
+        env._skate_velocity_ema = (
+            torch.where(fresh[:, None], current, filtered).detach().clone()
+        )
+        env._skate_motion_step = env.common_step_counter
+    return quat_apply_inverse(board.data.root_link_quat_w, env._skate_velocity_ema)[
+        :, 0
+    ].abs()
 
 
 def skate_stance_reward(env):
@@ -7773,7 +7807,23 @@ class SkateTrickCommand(CommandTerm):
         self.air_rotation += wrap_to_pi(yaw - self.previous_yaw) * airborne
         self.previous_yaw.copy_(yaw)
         active = (self.mode > 0) & ~self.completed
-        potential = (clearance.clamp(0, 0.035) / 0.035) * airborne
+        # Shape genuine small hops continuously; keep the stricter 12 mm /
+        # 60 ms flight requirement for credited landings and curriculum success.
+        unsupported = ~_skate_contacts(env, "board_support_contact").any(
+            -1
+        ) & skate_is_aboard(env)
+        potential = (clearance.clamp(0, 0.035) / 0.035) * unsupported
+        # A small, one-shot bridge into popping: supported nose-up preparation.
+        # Holding a manual pays nothing after its frontier; it never counts as
+        # flight or completion, and its total shaping is capped at 0.15 units.
+        w, x, y, z = board.data.root_link_quat_w.unbind(-1)
+        nose_up = (2 * (x * z - w * y)).clamp(0, 0.3) / 0.3
+        potential += (
+            0.15
+            * nose_up
+            * _skate_contacts(env, "board_support_contact").any(-1)
+            * skate_is_aboard(env)
+        )
         potential += (
             (self.mode == 2)
             * (self.air_rotation.abs() / math.pi).clamp(0, 1)
@@ -7889,6 +7939,8 @@ def skate_metric(env, field):
     if field == "aboard":
         return skate_is_aboard(env).float()
     if field == "speed":
+        return skate_sustained_speed(env)
+    if field == "raw_speed":
         return env.scene["board"].data.root_link_lin_vel_w[:, :2].norm(dim=-1)
     if field == "chain":
         return (env.command_manager.get_term("skate_trick").successes >= 2).float()
@@ -7908,3 +7960,85 @@ def skate_quality_cost(env, kind="impact"):
     if kind == "impact":
         return -trunk_vertical_accel_penalty(env) * strength
     return joint_torque_rate_l2(env) * strength
+
+
+def skate_control_strength(env, ramp_iterations=200):
+    """A one-way, checkpointed ramp after riding competence, independent of tricks.
+
+    The anchor is initialized after checkpoint load on the first cost call, so
+    continuing an older recipe does not jump straight to the final penalty.
+    Once started it cannot be escaped by deliberately lowering riding success.
+    """
+    if ramp_iterations <= 0:
+        raise ValueError("ramp_iterations must be positive")
+    state = getattr(env, "_skate_progress", {})
+    if "control_start_step" not in state:
+        if state.get("ride_ema", 0.0) < 0.7:
+            return 0.0
+        state["control_start_step"] = env.common_step_counter
+    return min(
+        1.0,
+        max(
+            0.0,
+            (env.common_step_counter - state["control_start_step"])
+            / (ramp_iterations * 24),
+        ),
+    )
+
+
+def skate_control_terms(env):
+    """Reset-safe measured changes, computed once per environment step."""
+    if getattr(env, "_skate_control_step", -1) == env.common_step_counter:
+        return env._skate_control_terms
+    env._skate_control_step = env.common_step_counter
+    action = env.action_manager.get_term("joint_pos")
+    neck = [
+        i
+        for i, name in enumerate(action.target_names)
+        if "neck" in name or "head" in name
+    ]
+    delta_sq = (env.action_manager.action - env.action_manager.prev_action).square()
+    torque = env.scene["robot"].data.actuator_force
+    previous = getattr(env, "_skate_previous_torque", torque)
+    torque_sq = (torque - previous).square().sum(-1)
+    env._skate_previous_torque = torque.detach().clone()
+    fresh = env.common_step_counter - env._skate_reset_step <= 1
+    delta_sq = torch.where(fresh[:, None], torch.zeros_like(delta_sq), delta_sq)
+    torque_sq = torch.where(fresh, torch.zeros_like(torque_sq), torque_sq)
+    neck_sq = delta_sq[:, neck].sum(-1)
+    env._skate_control_terms = dict(
+        action=delta_sq.sum(-1),
+        neck=neck_sq,
+        legs=delta_sq.sum(-1) - neck_sq,
+        torque=torque_sq,
+    )
+    return env._skate_control_terms
+
+
+def skate_control_cost(env, kind="action", ramp_iterations=200, trick_leg_scale=0.35):
+    """Positive costs: preserve large slow motion; price rapid reference/force changes."""
+    terms = skate_control_terms(env)
+    goal = env.command_manager.get_term("skate_trick")
+    pending = (goal.mode > 0) & ~goal.completed
+    freedom = torch.where(pending, trick_leg_scale, 1.0)
+    if kind == "action":
+        cost = terms["neck"] + freedom * terms["legs"]
+    elif kind == "neck":
+        cost = terms["neck"]
+    elif kind == "torque":
+        cost = terms["torque"] * freedom
+    else:
+        raise ValueError(kind)
+    return cost * skate_control_strength(env, ramp_iterations)
+
+
+def skate_foreaft_stance_reward(env):
+    """Optional light preference for useful foot support, not a prescribed yaw pose."""
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    robot, board = env.scene["robot"], env.scene["board"]
+    ids, _ = robot.find_sites(("left_foot", "right_foot"))
+    separation = robot.data.site_pos_w[:, ids[0]] - robot.data.site_pos_w[:, ids[1]]
+    span = quat_apply_inverse(board.data.root_link_quat_w, separation)[:, 0].abs()
+    supported = _skate_contacts(env, "feet_ground_contact").all(-1)
+    return (span / 0.08).clamp(0, 1) * supported * skate_riding_reward(env)

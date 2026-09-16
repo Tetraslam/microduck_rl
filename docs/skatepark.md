@@ -1,5 +1,105 @@
 # Skatepark experiment
 
+## Control/style correction experiment
+
+Checkpoint 2550 of v2 is preserved; the long v2 job was stopped. Its learned
+Gaussian exploration standard deviations were 0.54–1.55 radians, and deterministic
+flat playback still changed actions by 0.53 rad RMS per 20 ms. This is learned
+feedback oscillation as well as excessive training noise.
+
+The correction keeps the 107D input, 14 actions, physical board and unfiltered
+actuation. It uses native PPO entropy pressure (0.002 instead of 0.01), retaining
+learned noise, optimizer and normalizers on resume. No action filter or hard noise
+reset is applied. Additional action, neck and torque-change costs ramp over 200
+updates after riding competence. `control_start_step` persists in the existing
+curriculum checkpoint state; a resumed old recipe starts at zero additional
+cost, and deliberately falling cannot reset the ramp. Costs use measured changes
+once per step, actual action-target names, and reset-safe histories. Extra leg
+and torque costs are softened for requested tricks; head rate is not.
+
+Speed tracking now measures longitudinal rolling speed on the board, allowing a
+side-facing rider and fakie landings. Lateral sliding and stationary-board dancing
+still fail speed tracking. The optional fore/aft-foot bonus rewards supported
+foot spread while meeting the riding objective, not a fixed torso angle. Small
+genuine airborne progress is shaped below the success threshold; successful
+tricks still require the original clearance, airtime and landing conditions.
+
+Evidence plan: matched deterministic/stochastic rollouts, flat/roller/from-rest
+and steering tests, action/neck/torque deltas, and video inspection. Compare short
+medium/gentle smoothing continuations and a side-stance candidate before selecting
+a long run. Smoother parking is not a successful correction. Side-on nominal
+rolling holds passed 16/16, with 1.5° median tilt versus 4.5° forward-facing;
+a 100 mm crouch was kinematically feasible, but is not forced as a target pose.
+Actual useful motion and trick acquisition remain to be evaluated.
+
+### Short comparison (checkpoint 2550 + 400 updates)
+
+64 deterministic episodes per case, 12 s, seed 42, rolling start 0.5 m/s,
+speed request 0.4 m/s. Values below are for flat ground. Action/neck changes
+are RMS radians per control step; torque changes are RMS Nm per control step.
+
+| Recipe | Action change | Neck change | Torque change | Net distance | Survival |
+|---|---:|---:|---:|---:|---:|
+| Original 2550 | 0.527 | 0.526 | 0.222 | 2.17 m | 64/64 |
+| Medium | 0.347 | 0.256 | 0.163 | 2.10 m | 64/64 |
+| Gentle | 0.374 | 0.298 | 0.169 | 2.18 m | 64/64 |
+| Medium + side starts/foot-spread bonus | 0.344 | 0.249 | 0.165 | 2.11 m | 64/64 |
+
+Medium lowered learned noise from 0.88 to 0.24 rad. Side starts and the light
+foot-spread bonus did not clearly outperform the unconstrained medium recipe;
+they remain optional rather than imposing a preferred torso angle. All recipes
+still had zero self-initiated tricks. The gentle trial overrides the three added
+cost weights to -0.035/-0.06/-0.01; the side trial uses 15% sideways starts and a
+0.2 foot-spread reward. These are single-seed recipe comparisons, not convergence
+or statistical-optimality claims.
+
+The movement audit exposed a remaining shortcut: stationary-start trials
+accumulated about 4 m of back-and-forth board motion but advanced only 3–4 cm.
+The final reward therefore averages **signed world velocity** over 0.3 s before
+projecting into the board frame and taking magnitude. This preserves fakie and
+useful pumping while cancelling rapid reversals; it does not filter observations
+or actions. `skate_speed` now logs this sustained speed; `skate_raw_speed` retains
+the old instantaneous magnitude for comparison. Resets clear velocity history.
+A small capped frontier bonus also bridges supported nose-up preparation into
+genuine flight. Holding that pose pays zero, and it cannot count as a trick.
+
+Trial runs in `microduck-runs`:
+
+```text
+20260916-211235-control-medium-197063b9
+20260916-211303-control-gentle-19d1504a
+20260916-211303-control-side-21b220bf
+20260916-215302-control-sustained-1b41a4a1
+```
+
+`scripts/play_skatepark.py --report <path.json>` records quantitative playback
+results; `--stochastic` also measures training-style sampling. Reports include
+net progress, path length, reverse-motion fraction, actual neck/body angular
+speeds, knee flexion and foot spread, so quieter motor targets cannot substitute
+for actual motion quality.
+
+The additional 200-update sustained-motion trial was selected for continuation.
+Matched flat-ground reruns (64 environments) measured:
+
+| Metric | Original 2550 | Selected 3148 |
+|---|---:|---:|
+| Action-change RMS | 0.524 rad | 0.276 rad |
+| Neck action-change RMS | 0.523 rad | 0.212 rad |
+| Actual neck speed RMS | 3.93 rad/s | 2.29 rad/s |
+| Torque-change RMS | 0.221 Nm | 0.132 Nm |
+| Net travel in 12 s | 2.20 m | 1.91 m |
+| Survival | 64/64 | 64/64 |
+
+This trades about 13% of flat travel for substantially better control. Roller
+survival was 63/64, and travel stayed near the baseline (1.15 m versus 1.18 m).
+From rest it still advanced only about 9 cm in 12 s, and it recorded no successful
+ollies: propulsion/trick discovery are not solved. The optional side-stance recipe
+is not selected by default; letting posture emerge performed comparably without
+forcing a human-like orientation. The selected recipe retains nonzero learned
+exploration, with no noise reset or action filtering.
+
+Same-command before/after video: https://i.tetraslam.world/u/zqeP7e.mp4
+
 ## Run it
 
 ```bash
