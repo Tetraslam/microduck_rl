@@ -100,6 +100,16 @@ exploration, with no noise reset or action filtering.
 
 Same-command before/after video: https://i.tetraslam.world/u/zqeP7e.mp4
 
+Selected long continuation: `20260916-221730-skatepark-v3-13f6e27a`, clean code
+commit `5428b9f`, resumed from sustained-motion checkpoint 3148 for 6,852 more
+updates on one B200 / 4096 environments. The original v2 run was stopped and
+the short comparison jobs completed. Logs:
+
+```bash
+modal app logs ap-zGygRBoaUgLpad0lRSSErd
+modal volume ls microduck-runs 20260916-221730-skatepark-v3-13f6e27a
+```
+
 ## Run it
 
 ```bash
