@@ -165,3 +165,13 @@ not skating competence. The revised recipe gates pose shaping by actual command
 tracking, so parking cannot retain most of the positive reward stack. Its longer
 continuation starts from the earlier balanced-rider checkpoint 500 rather than
 the later parking policy. Tricks, propulsion and chains remain evaluation targets.
+
+The revised continuation is `20260916-192946-skatepark-v2-58dc6e79`, submitted
+from clean commit `a85fd6f` with 9,500 additional updates on a B200. It restored
+stage 1 from pilot checkpoint 500 and began at roughly 52k environment steps/s
+with no NaN terminations. Checkpoints remain every 50 updates. To inspect it:
+
+```bash
+modal app logs ap-wu6FS8n3iOkjnCGIF2IbHn
+modal volume ls microduck-runs 20260916-192946-skatepark-v2-58dc6e79
+```
