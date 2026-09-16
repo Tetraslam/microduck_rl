@@ -25,6 +25,20 @@ uv run --with pytest pytest tests/
 A 5-iteration smoke test at 64 envs catches ~95% of config errors for cents.
 Never launch a long run without one.
 
+### Modal training
+
+See `docs/modal.md` for remote runs, benchmarks, checkpoint download and resume.
+`modal run --detach scripts/modal/train.py --task <TASK_ID> --name <name>` submits
+one background GPU job and returns. Default: B200, 4096 envs, 1000 additional
+iterations, checkpoints every 50. Smoke first with `--num-envs 64 --iterations 5`.
+Use `--wait` instead of detached submission for a foreground smoke test.
+`MICRODUCK_MODAL_GPU` selects another card. Each run owns a unique directory in
+the `microduck-runs` Volume; resume uses `<run-id>/model_N.pt` and writes a new run.
+The launcher uses native mjlab training with atomic checkpoint rename and explicit
+Volume commit. Local CLI exit must not cancel training: use `.spawn()`, not a
+synchronous `.remote()` call. B300 requires a separate CUDA 13.1+ validation;
+the tested lockfile supports B200/H100/A100/L40S.
+
 ## Repo map
 
 - `src/mjlab_microduck/tasks/mdp.py` — ALL custom MDP functions (rewards, events,
