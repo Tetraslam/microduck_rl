@@ -1,5 +1,54 @@
 # Skatepark experiment
 
+## Overnight push-learning revision (2026-09-17)
+
+The finished v3 did not skate from rest: checkpoint 9999 advanced essentially
+zero distance. Merely continuing that balancing basin is not useful.
+
+New task: `Mjlab-Skatepark-Push-MicroDuck`. It retains the original 107 inputs
+and adds an explicit 2D push-phase cue (109D actor, 122D critic). The old task and
+board remain available for faithful replay. A low-deck 72 g cruiser uses 10 mm
+radius wheels, a 25 mm deck top, and shorter reachable kicktails. Bearing drag
+is scaled with wheel radius to avoid increasing rolling resistance by shrinking
+the wheels. All wheels/trucks remain passive and feet remain unattached.
+
+Working contract: phase supplies board-relative foot-position reward targets,
+not motor commands. The 14 outputs of the learned policy are still the only
+actuation. The support foot stays on the board; the other foot plants on the
+floor, pushes backwards, lifts and returns to the deck. Phases pause at the
+coasting stance when speed is sufficient. No periodic pushes or board forces
+are injected. Tests/evaluation must start from zero velocity to prove propulsion.
+
+An IK reach audit found the 49 mm legacy deck reachable only in demanding poses
+(support ankle near 1.56 rad). Lower decks allow more usable joint configurations.
+The new board must pass actual BAM holds and contact/phase smoke checks before
+training. Warm starts are explicit: `scripts/warmstart_skatepush.py` copies the
+actor/normalizer's 107D prefix, zero-pads phase weights, and initializes a fresh
+critic, optimizer and curriculum. This is not a same-task resume or a claimed
+learned gait. All PPO training runs on Modal.
+
+Acceptance remains behavioral: start from rest and generate forward travel via
+foot-ground contacts, retain control through terrain, then demonstrate actual
+board takeoff/landing/ride-away and multiple requests in one episode. Assisted
+spawns and reference tracking alone cannot establish success.
+
+The first warm push trial (`20260917-052343-push-warm-v1-85149b5a`, checkpoint
+500) achieved ~3 m in 12 s from rest with 32/32 survivors. Force diagnostics
+confirmed right-foot ground propulsion, no left-foot floor contact, and no
+foot/wheel contacts. However, video and a new non-foot contact sensor showed
+head/body support on the deck for ~86% of a short rollout. This is **not** an
+accepted skating policy. Its useful leg behavior is preserved for refinement.
+The exact source is archived in that run; experimental shorter reference strokes
+were not substituted into its replay.
+
+The foot-only refinement terminates non-foot robot contact with the board/floor
+and foot contact against the underside of the deck. It holds the physical BAM
+head servos at HOME (head action scale zero, not a kinematic weld) during this
+foundation pass. Head control can be restored after proper support is reliable.
+Push tracking now uses unclipped L1 velocity error so zero-mean vibration cannot
+improve its score. Recovery phases also charge unwanted floor contact. All of
+these differences are explicit configuration changes, not presentation filters.
+
 ## Control/style correction experiment
 
 Checkpoint 2550 of v2 is preserved; the long v2 job was stopped. Its learned

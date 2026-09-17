@@ -30,6 +30,7 @@ def main():
     )
     parser.add_argument("--difficulty", type=float, default=0.35)
     parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--task", default="Mjlab-Skatepark-MicroDuck")
     parser.add_argument(
         "--rider-yaw-deg",
         type=float,
@@ -79,8 +80,51 @@ def main():
     from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
     from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
-    task = "Mjlab-Skatepark-MicroDuck"
+    task = args.task
     cfg = load_env_cfg(task, play=True)
+    if "push" in cfg.observations:
+        from mjlab.sensor import ContactSensorCfg, ContactMatch
+
+        cfg.scene.sensors += (
+            ContactSensorCfg(
+                name="feet_wheel_contact",
+                primary=ContactMatch(
+                    mode="geom",
+                    pattern=r"^(left_foot_collision|right_foot_collision)$",
+                    entity="robot",
+                ),
+                secondary=ContactMatch(
+                    mode="geom", pattern=r".*_wheel_collision", entity="board"
+                ),
+                fields=("found", "force"),
+                reduce="netforce",
+                num_slots=1,
+            ),
+        )
+        existing = {s.name for s in cfg.scene.sensors}
+        for name, secondary in (
+            (
+                "nonfoot_board_contact",
+                ContactMatch(mode="subtree", pattern="deck", entity="board"),
+            ),
+            ("nonfoot_floor_contact", ContactMatch(mode="body", pattern="terrain")),
+        ):
+            if name not in existing:
+                cfg.scene.sensors += (
+                    ContactSensorCfg(
+                        name=name,
+                        primary=ContactMatch(
+                            mode="body",
+                            pattern=".*",
+                            entity="robot",
+                            exclude=("ankle_left", "ankle_right"),
+                        ),
+                        secondary=secondary,
+                        fields=("found", "force"),
+                        reduce="netforce",
+                        num_slots=1,
+                    ),
+                )
     cfg.scene.num_envs = args.num_envs
     cfg.seed = 42
     cfg.viewer.distance = 0.85
@@ -190,9 +234,28 @@ def evaluate(env, policy, args):
     knee_flexion = torch.zeros_like(tricks)
     foreaft_span = torch.zeros_like(tricks)
     rider_yaw_abs = torch.zeros_like(tricks)
+    floor_time = torch.zeros(args.num_envs, 2, device=env.device)
+    wheel_time = torch.zeros_like(floor_time)
+    floor_impulse = torch.zeros(args.num_envs, 2, 3, device=env.device)
+    deck_impulse = torch.zeros_like(floor_impulse)
+    nonfoot_time = torch.zeros_like(floor_time)
+    support_failures = torch.zeros_like(floor_time)
+    nonfoot_names = (
+        list(
+            dict.fromkeys(
+                slot.primary_name for slot in raw.scene["nonfoot_board_contact"]._slots
+            )
+        )
+        if "push" in raw.cfg.observations
+        else []
+    )
+    nonfoot_body_time = torch.zeros(
+        args.num_envs, len(nonfoot_names), device=env.device
+    )
     samples = torch.zeros_like(tricks)
     names = raw.action_manager.get_term("joint_pos").target_names
     target_ids = raw.action_manager.get_term("joint_pos").target_ids
+    action_scale = raw.action_manager.get_term("joint_pos").scale
     neck_ids = [i for i, name in enumerate(names) if "head" in name or "neck" in name]
     knee_ids = [i for i, name in enumerate(names) if "knee" in name]
     foot_ids, _ = raw.scene["robot"].find_sites(("left_foot", "right_foot"))
@@ -220,9 +283,44 @@ def evaluate(env, policy, args):
                 world_x[active] = offset[active, 0]
                 duration[active] += raw.step_dt
                 measured = active & (duration > 2 * raw.step_dt)
+                if "push" in raw.cfg.observations:
+                    floor = raw.scene["feet_floor_contact"].data
+                    wheels = raw.scene["feet_wheel_contact"].data
+                    floor_time[active] += (
+                        floor.found.reshape(args.num_envs, 2)[active] > 0
+                    ) * raw.step_dt
+                    wheel_time[active] += (
+                        wheels.found.reshape(args.num_envs, 2)[active] > 0
+                    ) * raw.step_dt
+                    floor_impulse[active] += (
+                        floor.force.reshape(args.num_envs, 2, 3)[active] * raw.step_dt
+                    )
+                    deck_impulse[active] += (
+                        raw.scene["feet_ground_contact"].data.force.reshape(
+                            args.num_envs, 2, 3
+                        )[active]
+                        * raw.step_dt
+                    )
+                    for j, name in enumerate(
+                        ("nonfoot_board_contact", "nonfoot_floor_contact")
+                    ):
+                        nonfoot_time[active, j] += (
+                            raw.scene[name].data.found.reshape(args.num_envs, -1)[
+                                active
+                            ]
+                            > 0
+                        ).any(-1) * raw.step_dt
+                    nonfoot_body_time[active] += (
+                        raw.scene["nonfoot_board_contact"].data.found.reshape(
+                            args.num_envs, -1
+                        )[active]
+                        > 0
+                    ) * raw.step_dt
                 am = raw.action_manager
-                delta = am.action - am.prev_action
-                second_delta = am.action - 2 * am.prev_action + am.prev_prev_action
+                delta = (am.action - am.prev_action) * action_scale
+                second_delta = (
+                    am.action - 2 * am.prev_action + am.prev_prev_action
+                ) * action_scale
                 torque = raw.scene["robot"].data.actuator_force
                 action_sq[measured] += delta[measured].square().mean(-1)
                 neck_sq[measured] += delta[measured][:, neck_ids].square().mean(-1)
@@ -281,6 +379,14 @@ def evaluate(env, policy, args):
                     board.data.root_link_ang_vel_b[active, 2] * raw.step_dt
                 )
                 failed |= active & raw.reset_terminated
+                if "push" in raw.cfg.observations:
+                    for j, name in enumerate(
+                        ("_push_nonfoot_failure", "_push_underside_failure")
+                    ):
+                        if hasattr(raw, name):
+                            support_failures[active, j] = getattr(raw, name)[
+                                active
+                            ].float()
                 seen |= done.bool()
                 if writer:
                     frame = raw.render()
@@ -359,6 +465,51 @@ def evaluate(env, policy, args):
             "two_trick_chain_fraction": (tricks >= 2).float().mean().item(),
         }
         print(json.dumps(report, indent=2))
+        if "push" in raw.cfg.observations:
+            report.update(
+                floor_contact_fraction=(
+                    floor_time / duration[:, None].clamp_min(raw.step_dt)
+                )
+                .mean(0)
+                .tolist(),
+                wheel_contact_fraction=(
+                    wheel_time / duration[:, None].clamp_min(raw.step_dt)
+                )
+                .mean(0)
+                .tolist(),
+                floor_impulse_raw_ns=floor_impulse.mean(0).tolist(),
+                deck_impulse_raw_ns=deck_impulse.mean(0).tolist(),
+            )
+            report["nonfoot_contact_fraction"] = (
+                (nonfoot_time / duration[:, None].clamp_min(raw.step_dt))
+                .mean(0)
+                .tolist()
+            )
+            report["support_failure_fraction"] = support_failures.mean(0).tolist()
+            fractions = (
+                (nonfoot_body_time / duration[:, None].clamp_min(raw.step_dt))
+                .mean(0)
+                .tolist()
+            )
+            report["nonfoot_board_by_body"] = {
+                name: value
+                for name, value in zip(nonfoot_names, fractions)
+                if value > 0
+            }
+            print(
+                json.dumps(
+                    {
+                        k: report[k]
+                        for k in (
+                            "floor_contact_fraction",
+                            "wheel_contact_fraction",
+                            "floor_impulse_raw_ns",
+                            "deck_impulse_raw_ns",
+                        )
+                    },
+                    indent=2,
+                )
+            )
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")

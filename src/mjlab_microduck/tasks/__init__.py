@@ -94,7 +94,7 @@ class SkateOnPolicyRunner(MicroduckOnPolicyRunner):
         attach_metadata_to_onnx(
             str(Path(path) / filename),
             {
-                "skate_observation_contract": "skatepark-v1:actor61+board26+terrain15+goal5",
+                "skate_observation_contract": "skatepush-v2:actor61+board26+terrain15+goal5+phase2" if 'push' in self.env.unwrapped.cfg.observations else "skatepark-v1:actor61+board26+terrain15+goal5",
                 "skate_action_offset": action.offset[0].cpu().tolist(),
             },
         )
@@ -148,6 +148,16 @@ register_mjlab_task(
     env_cfg=make_microduck_skatepark_env_cfg(),
     play_env_cfg=make_microduck_skatepark_env_cfg(play=True),
     rl_cfg=MicroduckSkateparkRlCfg,
+    runner_cls=SkateOnPolicyRunner,
+)
+
+from .microduck_skatepush_env_cfg import make_microduck_skatepush_env_cfg, MicroduckSkatePushRlCfg
+
+register_mjlab_task(
+    task_id="Mjlab-Skatepark-Push-MicroDuck",
+    env_cfg=make_microduck_skatepush_env_cfg(),
+    play_env_cfg=make_microduck_skatepush_env_cfg(play=True),
+    rl_cfg=MicroduckSkatePushRlCfg,
     runner_cls=SkateOnPolicyRunner,
 )
 
